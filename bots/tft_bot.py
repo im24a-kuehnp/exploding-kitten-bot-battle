@@ -18,6 +18,7 @@ from game.bots.base import (
     Bot,
     DrawCardAction,
     PlayCardAction,
+    PlayComboAction,
 )
 from game.bots.view import BotView
 from game.cards.base import Card
@@ -52,6 +53,12 @@ class TFTBot(Bot):
         
         # Track if we just shuffled (to avoid wasting Shuffle cards)
         self._just_shuffled: bool = False
+        
+        # Track what we saw with See the Future (from CARDS_PEEKED events)
+        self._last_peeked_cards: list[str] = []  # Card types we saw
+        
+        # Track if we know EK is on top (from STF)
+        self._ek_on_top: bool = False
         
         # =====================================================================
         # CHAT PHRASES - Strategic bot personality
@@ -186,10 +193,17 @@ class TFTBot(Bot):
         if view.draw_pile_count == 0:
             return 0.0
         
-        # Estimate EKs remaining: (players - 1) minus eliminations
-        # This is approximate since we don't know exact count
+        # More accurate: Track eliminations to estimate EKs remaining
+        # Start with (num_players - 1) EKs, subtract eliminations
         alive_players = len(view.other_players) + 1  # +1 for us
-        estimated_eks = max(1, alive_players - 1)
+        
+        # If we tracked num_players at game start, use that
+        if self._num_players > 0:
+            eliminations = self._num_players - alive_players
+            estimated_eks = max(1, (self._num_players - 1) - eliminations)
+        else:
+            # Fallback: estimate based on current players
+            estimated_eks = max(1, alive_players - 1)
         
         return estimated_eks / view.draw_pile_count
     
@@ -245,7 +259,24 @@ class TFTBot(Bot):
             self._just_shuffled = True  # Mark that we shuffled
             return PlayCardAction(card=shuffle_cards[0])
         
-        # 2. PRIORITY: See the Future (great information)
+        # 2. PRIORITY: If we know EK is on top, use Skip/Shuffle immediately
+        if self._ek_on_top:
+            # EK is on top - avoid drawing!
+            skip_cards = view.get_cards_of_type("SkipCard")
+            if skip_cards:
+                view.say("Avoiding the top!")
+                self._ek_on_top = False  # Reset after using skip
+                return PlayCardAction(card=skip_cards[0])
+            
+            # No skip? Use shuffle to reset
+            shuffle_cards = view.get_cards_of_type("ShuffleCard")
+            if shuffle_cards and view.draw_pile_count > 0:
+                view.say("Shuffling to avoid EK!")
+                self._ek_on_top = False
+                self._just_shuffled = True
+                return PlayCardAction(card=shuffle_cards[0])
+        
+        # 3. PRIORITY: See the Future (great information)
         # Use based on probability thresholds
         stf_cards = view.get_cards_of_type("SeeTheFutureCard")
         if stf_cards and view.draw_pile_count > 0:
@@ -257,30 +288,71 @@ class TFTBot(Bot):
             elif ek_probability >= 0.33 and len(stf_cards) > 1:
                 view.say(random.choice(self._stf_phrases))
                 return PlayCardAction(card=stf_cards[0])
+            # At 25%+, use STF if we have 3+ (very safe to use)
+            elif ek_probability >= 0.25 and len(stf_cards) >= 3:
+                view.say(random.choice(self._stf_phrases))
+                return PlayCardAction(card=stf_cards[0])
         
-        # 3. PRIORITY: Steal (Favor) - try to get Shuffle/STF
-        # Use when probability is getting high or we're low on cards
-        if ek_probability >= 0.30 or len(view.my_hand) < 4:
-            favor_cards = view.get_cards_of_type("FavorCard")
-            if favor_cards:
-                # Check if Favor can actually be played (targets must have cards)
-                playable_favors = [
-                    card for card in favor_cards
-                    if card.can_play(view, is_own_turn=True)
-                ]
-                if playable_favors and view.other_players:
-                    # Find targets that actually have cards
+        # 4. PRIORITY: Play combos to steal valuable cards
+        combos = self._find_possible_combos(view.my_hand)
+        if combos and view.other_players:
+            # Prefer three-of-a-kind (stronger - can name a card)
+            for combo_type, combo_cards in combos:
+                if combo_type == "three_of_a_kind":
                     valid_targets = [
                         pid for pid in view.other_players
                         if view.other_player_card_counts.get(pid, 0) > 0
                     ]
                     if valid_targets:
-                        # Target player with most cards (more likely to have Shuffle/STF)
                         target = max(valid_targets, key=lambda pid: view.other_player_card_counts.get(pid, 0))
+                        view.say("Combo time!")
+                        return PlayComboAction(cards=combo_cards, target_player_id=target)
+            
+            # Fall back to two-of-a-kind
+            combo_type, combo_cards = combos[0]
+            if combo_type in ("two_of_a_kind", "three_of_a_kind"):
+                valid_targets = [
+                    pid for pid in view.other_players
+                    if view.other_player_card_counts.get(pid, 0) > 0
+                ]
+                if valid_targets:
+                    target = max(valid_targets, key=lambda pid: view.other_player_card_counts.get(pid, 0))
+                    return PlayComboAction(cards=combo_cards, target_player_id=target)
+        
+        # 5. PRIORITY: Steal (Favor) - try to get Shuffle/STF/Defuse
+        # Use when probability is getting high or we're low on cards
+        # Also use if opponent has significantly more cards
+        favor_cards = view.get_cards_of_type("FavorCard")
+        if favor_cards:
+            # Check if Favor can actually be played (targets must have cards)
+            playable_favors = [
+                card for card in favor_cards
+                if card.can_play(view, is_own_turn=True)
+            ]
+            if playable_favors and view.other_players:
+                # Find targets that actually have cards
+                valid_targets = [
+                    pid for pid in view.other_players
+                    if view.other_player_card_counts.get(pid, 0) > 0
+                ]
+                if valid_targets:
+                    # Target player with most cards (more likely to have Shuffle/STF)
+                    target = max(valid_targets, key=lambda pid: view.other_player_card_counts.get(pid, 0))
+                    target_card_count = view.other_player_card_counts.get(target, 0)
+                    my_card_count = len(view.my_hand)
+                    
+                    # Steal if: high probability, low cards, or opponent has way more cards
+                    should_steal = (
+                        ek_probability >= 0.25 or 
+                        my_card_count < 5 or 
+                        (target_card_count >= my_card_count + 3)
+                    )
+                    
+                    if should_steal:
                         view.say(random.choice(self._steal_phrases))
                         return PlayCardAction(card=playable_favors[0], target_player_id=target)
         
-        # 4. PRIORITY: Skip Cards (defensive or when under attack)
+        # 6. PRIORITY: Skip Cards (defensive or when under attack)
         # Use Skip (passive) when under attack or playing defensively
         if view.my_turns_remaining > 1:
             skip_cards = view.get_cards_of_type("SkipCard")
@@ -294,7 +366,7 @@ class TFTBot(Bot):
                     view.say(random.choice(self._skip_phrases))
                     return PlayCardAction(card=skip_cards[0])
         
-        # 5. AGGRESSIVE MODE: At 50%+ probability, play aggressively
+        # 7. AGGRESSIVE MODE: At 50%+ probability, play aggressively
         if ek_probability >= 0.50:
             # Try to steal from one target repeatedly
             favor_cards = view.get_cards_of_type("FavorCard")
@@ -322,7 +394,7 @@ class TFTBot(Bot):
                 view.say(random.choice(self._skip_phrases))
                 return PlayCardAction(card=skip_cards[0])
         
-        # 6. END GAME: Save Attacks for when we have 3+ and opponent has few cards
+        # 8. END GAME: Save Attacks for when we have 3+ and opponent has many cards
         # Don't pass 7-turn attack to someone with 1 card and high EK chance
         attack_cards = view.get_cards_of_type("AttackCard")
         if attack_cards and len(attack_cards) >= 3 and view.other_players:
@@ -332,6 +404,17 @@ class TFTBot(Bot):
                 if view.other_player_card_counts.get(pid, 0) >= 6
             ]
             if good_targets:
+                target = max(good_targets, key=lambda pid: view.other_player_card_counts.get(pid, 0))
+                view.say(random.choice(self._attack_phrases))
+                return PlayCardAction(card=attack_cards[0], target_player_id=target)
+        
+        # 9. Use Attack if we have 2+ and opponent has 4+ cards (moderate aggression)
+        if attack_cards and len(attack_cards) >= 2 and view.other_players:
+            good_targets = [
+                pid for pid in view.other_players
+                if view.other_player_card_counts.get(pid, 0) >= 4
+            ]
+            if good_targets and ek_probability >= 0.40:
                 target = max(good_targets, key=lambda pid: view.other_player_card_counts.get(pid, 0))
                 view.say(random.choice(self._attack_phrases))
                 return PlayCardAction(card=attack_cards[0], target_player_id=target)
@@ -410,9 +493,28 @@ class TFTBot(Bot):
         # Track deck shuffles (resets to shuffled/unknown state)
         if event.event_type == EventType.DECK_SHUFFLED:
             self._deck_shuffled = True
+            self._ek_on_top = False  # Reset EK tracking after shuffle
             # Note: We don't reset _just_shuffled here because we want to prevent
             # shuffling twice in the same multi-turn sequence. It resets when
             # we start a new turn cycle (my_turns_remaining == 1)
+        
+        # Track what we saw with See the Future
+        if event.event_type == EventType.CARDS_PEEKED:
+            if event.player_id == view.my_id:
+                card_types = event.data.get("card_types", [])
+                self._last_peeked_cards = card_types
+                # Check if EK is in the top 3 cards
+                if card_types and "ExplodingKittenCard" in card_types:
+                    # Check if it's the first card (top of deck)
+                    if card_types[0] == "ExplodingKittenCard":
+                        self._ek_on_top = True
+                    # Or if it's in top 3 and probability is high, be cautious
+                    else:
+                        # Calculate current EK probability
+                        current_ek_prob = self._calculate_ek_probability(view)
+                        if current_ek_prob >= 0.40:
+                            # EK is in top 3, be careful
+                            self._ek_on_top = True  # Conservative: treat as if on top
         
         # Track player eliminations (updates EK count estimate)
         if event.event_type == EventType.PLAYER_ELIMINATED:

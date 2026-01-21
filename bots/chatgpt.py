@@ -30,9 +30,11 @@ class StrategicBot(Bot):
         # 2. Use Favor if opponents have more cards than us
         favor = self._find_card(hand, "FavorCard")
         if favor:
-            target = self._best_favor_target(view)
-            if target:
-                return PlayCardAction(card=favor, target_player_id=target)
+            # Check if Favor can actually be played (targets must have cards)
+            if favor.can_play(view, is_own_turn=True):
+                target = self._best_favor_target(view)
+                if target and view.other_player_card_counts.get(target, 0) > 0:
+                    return PlayCardAction(card=favor, target_player_id=target)
 
         # 3. Play two-of-a-kind combo if available
         combo = self._two_of_a_kind_combo(hand, view)
@@ -57,8 +59,8 @@ class StrategicBot(Bot):
 
         # Only nope serious threats
         if triggering_event.event_type == EventType.CARD_PLAYED:
-            card = triggering_event.data.get("card")
-            if card and card.card_type in {
+            card_type = triggering_event.data.get("card_type", "")
+            if card_type in {
                 "AttackCard",
                 "FavorCard",
                 "ShuffleCard",
@@ -130,7 +132,9 @@ class StrategicBot(Bot):
 
         by_type: dict[str, list[Card]] = {}
         for c in hand:
-            by_type.setdefault(c.card_type, []).append(c)
+            # Only include cards that can combo
+            if c.can_combo():
+                by_type.setdefault(c.card_type, []).append(c)
 
         for cards in by_type.values():
             if len(cards) >= 2:

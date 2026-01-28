@@ -235,8 +235,8 @@ class TFTBot(Bot):
         is_shuffled = self._is_deck_shuffled(view)
         
         # Random chance to say something during turn (20% chance)
-        if random.random() < 0.2:
-            view.say(random.choice(self._turn_phrases))
+        #if random.random() < 0.2:
+        view.say(random.choice(self._turn_phrases))
         
         # =====================================================================
         # EARLY GAME: Before first EK drawn - JUST DRAW

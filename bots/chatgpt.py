@@ -13,7 +13,7 @@ from game.history import GameEvent, EventType
 class StrategicBot(Bot):
     @property
     def name(self) -> str:
-        return "StrategicBot"
+        return "chatgpt"
 
     # ----------------------------
     # TURN LOGIC
@@ -92,7 +92,7 @@ class StrategicBot(Bot):
         pass
 
     def on_explode(self, view: BotView) -> None:
-        view.say("I regret nothing.")
+        view.say("ihr sind alli geeks")
 
     # ----------------------------
     # HELPER METHODS
